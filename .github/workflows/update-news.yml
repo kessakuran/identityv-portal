@@ -1,0 +1,87 @@
+# 毎日 fetcher.py を自動実行し、news.json に変化があればコミット＆プッシュします。
+# 新着があれば Discord に通知し（任意）、Vercel の再デプロイも促します（任意）。
+#
+# 必要な設定（リポジトリの Settings で行います。詳しくは README.md）
+#   Settings → Actions → General → Workflow permissions → 「Read and write permissions」
+# 任意の設定
+#   Secrets  DISCORD_WEBHOOK_URL    … Discord の Webhook URL（設定すると通知が届く）
+#   Secrets  VERCEL_DEPLOY_HOOK_URL … Vercel の Deploy Hook URL（自動デプロイされない場合だけ）
+#   Variables PORTAL_URL            … 公開サイトのURL（通知のリンク先をサイトの詳細表示にする）
+#   Variables NOTIFY_CATEGORIES     … 通知するカテゴリ（例: maintenance,update）。空なら全部
+name: Update news
+
+on:
+  schedule:
+    # cron は UTC（世界標準時）で書きます。日本時間 = UTC + 9時間
+    #   "17 0 * * *"  → 毎日 9:17（日本時間）
+    #   "17 9 * * *"  → 毎日 18:17（日本時間）
+    # 毎時 0 分は GitHub が混み合って遅れやすいので、半端な分にしています。
+    - cron: "17 0 * * *"
+    - cron: "17 9 * * *"
+  workflow_dispatch:          # Actions 画面の「Run workflow」ボタンから手動でも実行できる
+
+permissions:
+  contents: write             # news.json をコミットするため
+
+# 前の実行が終わる前に次が始まって、コミットがぶつからないようにする
+concurrency:
+  group: update-news
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      VERCEL_DEPLOY_HOOK_URL: ${{ secrets.VERCEL_DEPLOY_HOOK_URL }}
+      PORTAL_URL: ${{ vars.PORTAL_URL }}
+      NOTIFY_CATEGORIES: ${{ vars.NOTIFY_CATEGORIES }}
+      TZ: Asia/Tokyo
+
+    steps:
+      - name: リポジトリを取得
+        uses: actions/checkout@v4
+
+      - name: Python を用意
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 依存パッケージをインストール
+        run: pip install -r requirements.txt
+
+      - name: 更新前の news.json を控えておく（通知で差分を取るため）
+        run: cp data/news.json "$RUNNER_TEMP/news.old.json" || echo '{}' > "$RUNNER_TEMP/news.old.json"
+
+      - name: 最新ニュースを取得
+        run: python fetcher.py --pages 2
+
+      - name: 変化があればコミットしてプッシュ
+        id: commit
+        run: |
+          if git diff --quiet -- data/news.json; then
+            echo "news.json に変更はありません"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/news.json
+          git commit -m "Update news.json ($(date '+%Y-%m-%d %H:%M'))"
+          # 実行中に別のコミットが入っていても取り込んでからプッシュする
+          git pull --rebase --autostash
+          git push
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Discord に新着を通知（DISCORD_WEBHOOK_URL を設定したときだけ）
+        if: steps.commit.outputs.changed == 'true' && env.DISCORD_WEBHOOK_URL != ''
+        # 通知に失敗しても、ニュースの更新自体は成功扱いにする
+        continue-on-error: true
+        run: python notify_discord.py --old "$RUNNER_TEMP/news.old.json" --new data/news.json
+
+      - name: Vercel に再デプロイを依頼（VERCEL_DEPLOY_HOOK_URL を設定したときだけ）
+        if: steps.commit.outputs.changed == 'true' && env.VERCEL_DEPLOY_HOOK_URL != ''
+        continue-on-error: true
+        run: curl -fsS -X POST "$VERCEL_DEPLOY_HOOK_URL" > /dev/null && echo "Deploy Hook を呼び出しました"
